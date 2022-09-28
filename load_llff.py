@@ -5,6 +5,7 @@ import os, imageio
 ########## Slightly modified version of LLFF data loading code 
 ##########  see https://github.com/Fyusion/LLFF for original
 
+# 两种类型的图片处理：factors传入下采样的参数、resolution传入规定大小的图像参数；
 def _minify(basedir, factors=[], resolutions=[]):
     needtoload = False
     for r in factors:
@@ -60,7 +61,7 @@ def _minify(basedir, factors=[], resolutions=[]):
         
         
 def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
-    
+    # _load_data将图片下采样后输出imgs，并且输出数据集的位姿参数poses和深度范围bds
     poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy'))
     poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0])
     bds = poses_arr[:, -2:].transpose([1,0])
@@ -70,7 +71,8 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
     sh = imageio.imread(img0).shape
     
     sfx = ''
-    
+
+    # 判断是否有下采样的相关参数，如果有，则对图像进行下采样
     if factor is not None:
         sfx = '_{}'.format(factor)
         _minify(basedir, factors=[factor])
@@ -87,17 +89,20 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
         sfx = '_{}x{}'.format(width, height)
     else:
         factor = 1
-    
+
+    # 判断是否存在下采样的路径'./data/nerf_llff_data/fern\\images_8'
     imgdir = os.path.join(basedir, 'images' + sfx)
     if not os.path.exists(imgdir):
         print( imgdir, 'does not exist, returning' )
         return
-    
+
+    # 判断pose数量与图像个数是否一致，
     imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
     if poses.shape[-1] != len(imgfiles):
         print( 'Mismatch between imgs {} and poses {} !!!!'.format(len(imgfiles), poses.shape[-1]) )
         return
-    
+
+    # 获取处理后的图像shape，sh=（378,504,3）=（3024/8, 4032/8, 3）
     sh = imageio.imread(imgfiles[0]).shape
     poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1])
     poses[2, 4, :] = poses[2, 4, :] * 1./factor
@@ -110,7 +115,8 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
             return imageio.imread(f, ignoregamma=True)
         else:
             return imageio.imread(f)
-        
+
+    # 读取所有图像数据并把值缩小到0-1之间，imgs存储所有图片信息，大小为（378,504,3,20）
     imgs = imgs = [imread(f)[...,:3]/255. for f in imgfiles]
     imgs = np.stack(imgs, -1)  
     
@@ -126,7 +132,7 @@ def normalize(x):
     return x / np.linalg.norm(x)
 
 def viewmatrix(z, up, pos):
-    vec2 = normalize(z)
+    vec2 = normalize(z)  # the third row
     vec1_avg = up
     vec0 = normalize(np.cross(vec1_avg, vec2))
     vec1 = normalize(np.cross(vec2, vec0))
@@ -138,13 +144,17 @@ def ptstocam(pts, c2w):
     return tt
 
 def poses_avg(poses):
-
-    hwf = poses[0, :3, -1:]
-
-    center = poses[:, :3, 3].mean(0)
+    '''
+        为什么将所有位姿平均后就能得到c2w？
+        相机位姿的的表示方式有两种，c2w或w2c，二者互为反过程。
+        这里应该是用c2w表示相机位姿，所以所有位姿平均后就能得到平均相机的c2w
+        no! this do not match the code of 'rerender' function. god.
+    '''
+    hwf = poses[0, :3, -1:]  # hwf 变量的含义是：图像的 height，width 和 focal length
+    center = poses[:, :3, 3].mean(0)  # center is the mean of the translation of all cam mat
     vec2 = normalize(poses[:, :3, 2].sum(0))
     up = poses[:, :3, 1].sum(0)
-    c2w = np.concatenate([viewmatrix(vec2, up, center), hwf], 1)
+    c2w = np.concatenate([viewmatrix(vec2, up, center), hwf], 1)  # viewmatrix will compt the other vec by vec2 & up
     
     return c2w
 
@@ -164,7 +174,9 @@ def render_path_spiral(c2w, up, rads, focal, zdelta, zrate, rots, N):
 
 
 def recenter_poses(poses):
-
+    # 将位姿都组装成标准形式
+    # R | T
+    # 0 | 1
     poses_ = poses+0
     bottom = np.reshape([0,0,0,1.], [1,4])
     c2w = poses_avg(poses)
@@ -172,8 +184,8 @@ def recenter_poses(poses):
     bottom = np.tile(np.reshape(bottom, [1,1,4]), [poses.shape[0],1,1])
     poses = np.concatenate([poses[:,:3,:4], bottom], -2)
 
-    poses = np.linalg.inv(c2w) @ poses
-    poses_[:,:3,:4] = poses[:,:3,:4]
+    poses = np.linalg.inv(c2w) @ poses  # why inv?
+    poses_[:,:3,:4] = poses[:,:3,:4]  # replace the original height，width and focal length
     poses = poses_
     return poses
 
@@ -257,15 +269,17 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
     sc = 1. if bd_factor is None else 1./(bds.min() * bd_factor)
     poses[:,:3,3] *= sc
     bds *= sc
-    
+
+    # 计算poses的均值，将所有pose做该均值的逆转换，即重新定义了世界坐标系，原点大致在被测物中心；
     if recenter:
         poses = recenter_poses(poses)
-        
+    # 经过recenter pose均值逆变换处理后，旋转矩阵变为单位阵，平移矩阵变为0
+
+    # 360度场景 ( what is the special work for 360 scenes)
     if spherify:
         poses, render_poses, bds = spherify_poses(poses, bds)
 
     else:
-        
         c2w = poses_avg(poses)
         print('recentered', c2w.shape)
         print(c2w[:3,:4])
@@ -297,6 +311,7 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
             N_views/=2
 
         # Generate poses for spiral path
+        # 生成用来渲染的螺旋路径的位姿，是一个list，有120个（N_views）元素，每个元素shape（3,5）
         render_poses = render_path_spiral(c2w_path, up, rads, focal, zdelta, zrate=.5, rots=N_rots, N=N_views)
         
         
@@ -307,7 +322,7 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
     print(poses.shape, images.shape, bds.shape)
     
     dists = np.sum(np.square(c2w[:3,3] - poses[:,:3,3]), -1)
-    i_test = np.argmin(dists)
+    i_test = np.argmin(dists)  # (cam to world)距离最小值对应的下标，12
     print('HOLDOUT view is', i_test)
     
     images = images.astype(np.float32)

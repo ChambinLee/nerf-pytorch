@@ -39,15 +39,17 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024 * 64
     """Prepares inputs and applies network 'fn'.
     """
     inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
-    embedded = embed_fn(inputs_flat)
+    embedded = embed_fn(inputs_flat)  # positional encoding of xyz
 
     if viewdirs is not None:
-        input_dirs = viewdirs[:, None].expand(inputs.shape)
-        input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
-        embedded_dirs = embeddirs_fn(input_dirs_flat)
-        embedded = torch.cat([embedded, embedded_dirs], -1)
+        input_dirs = viewdirs[:, None].expand(inputs.shape)  # torch.Size([1024, 64, 3])
+        input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])  # torch.Size([65536, 3])
+        embedded_dirs = embeddirs_fn(input_dirs_flat)  # positional encoding of direction
+        embedded = torch.cat([embedded, embedded_dirs], -1)  # 将两个张量拼接在一起，torch.Size([65536, 90])
 
+    # 以更小的patch-netchunk送进网络跑前向
     outputs_flat = batchify(fn, netchunk)(embedded)
+    # reshape为（1024,64,4），4包括RGB和alpha；
     outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
     return outputs
 
@@ -177,13 +179,15 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
-    embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
+    # 对x,y,z和方向信息都进行了位置编码，输入是x,y,z三维，输出是input_ch=63
+    # embed_fn is positional encoding function, input_ch is up to positional encodding (how many sin used).
+    embed_fn, input_ch = get_embedder(args.multires, args.i_embed)  # input_ch=63=3*10*2_+3, 2 means cos+sin
 
     input_ch_views = 0
     embeddirs_fn = None
-    if args.use_viewdirs:
+    if args.use_viewdirs:  # 如果use_viewdirs为真，则input_ch_views=27维
         embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
-    output_ch = 5 if args.N_importance > 0 else 4
+    output_ch = 5 if args.N_importance > 0 else 4  # 输出的通道数, why the output channel up to 5 if N_importance > 0???
     skips = [4]
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
@@ -197,6 +201,7 @@ def create_nerf(args):
                           input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
         grad_vars += list(model_fine.parameters())
 
+    # 定义一个查询函数, use "network_fn" to infer RGB+density from "inputs" and "viewdirs".
     network_query_fn = lambda inputs, viewdirs, network_fn: run_network(inputs, viewdirs, network_fn,
                                                                         embed_fn=embed_fn,
                                                                         embeddirs_fn=embeddirs_fn,
@@ -205,7 +210,7 @@ def create_nerf(args):
     # Create optimizer
     optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
 
-    start = 0
+    start = 0  # training step num
     basedir = args.basedir
     expname = args.expname
 
@@ -429,7 +434,7 @@ def config_parser():
                         help='experiment name')
     parser.add_argument("--basedir", type=str, default='./logs/',
                         help='where to store ckpts and logs')
-    parser.add_argument("--datadir", type=str, default='./data/llff/fern',
+    parser.add_argument("--datadir", type=str, default='./data/nerf_llff_data/fern',
                         help='input data directory')
 
     # training options
@@ -513,7 +518,7 @@ def config_parser():
     # 是否使用标准化坐标系
     parser.add_argument("--no_ndc", action='store_true',
                         help='do not use normalized device coordinates (set for non-forward facing scenes)')
-    # 在不透明度上均匀采样代替深度值
+
     parser.add_argument("--lindisp", action='store_true',
                         help='sampling linearly in disparity rather than depth')
     # 360度场景
@@ -562,7 +567,7 @@ def train():
             print('Auto LLFF holdout,', args.llffhold)
             i_test = np.arange(images.shape[0])[::args.llffhold]
 
-        # 验证集和测试集相同
+        # 验证集和测试集相同???
         i_val = i_test
         # 剩下的部分当作训练集
         i_train = np.array([i for i in np.arange(int(images.shape[0])) if
